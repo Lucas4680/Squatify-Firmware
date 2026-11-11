@@ -8,3 +8,10 @@ CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n
 
 # The speaker processing runs floating-point maths on every sample: build with -O2.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# USB: show up as a speaker plus a serial (COM) port that carries the log.
+# Uses the TinyUSB configuration and descriptors in main/tusb.
+CONFIG_USB_DEVICE_UAC_AS_PART=y
+
+# The firmware reads the USB stream as 16-bit stereo.
+CONFIG_UAC_SPEAKER_CHANNEL_NUM=2

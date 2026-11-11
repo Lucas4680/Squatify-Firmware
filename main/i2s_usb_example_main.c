@@ -23,6 +23,14 @@
 #include "speaker_config.h"
 #include "speaker_dsp.h"
 
+// With CONFIG_USB_DEVICE_UAC_AS_PART enabled the device is a USB speaker
+// plus a serial port that carries this log (see main/tusb). With it
+// disabled the device is a plain USB speaker and the log is only on UART0.
+#if CONFIG_USB_DEVICE_UAC_AS_PART
+#include "usb_interfaces.h"
+#include "usb_serial_log.h"
+#endif
+
 
 // ============================================================
 // HARDWARE
@@ -62,6 +70,18 @@
 
 _Static_assert((int)SPK_SAMPLE_RATE_HZ == SAMPLE_RATE,
                "speaker_config.h sample rate must match the I2S sample rate");
+
+// The USB callback below reads the stream as 16-bit stereo frames.
+_Static_assert(CONFIG_UAC_SPEAKER_CHANNEL_NUM == AUDIO_CHANNELS,
+               "set 'UAC Speaker channel number' to 2 in the SDK configuration");
+
+_Static_assert(CONFIG_UAC_SAMPLE_RATE == SAMPLE_RATE,
+               "set 'UAC sample rate' to 48000 in the SDK configuration");
+
+#ifdef CONFIG_UAC_BYTES_PER_SAMPLE
+_Static_assert(CONFIG_UAC_BYTES_PER_SAMPLE * 8 == AUDIO_BITS,
+               "set 'UAC bit resolution' to 16-bit in the SDK configuration");
+#endif
 
 
 // ============================================================
@@ -616,11 +636,30 @@ static void usb_audio_init(void)
         .set_mute_cb = usb_audio_mute_cb,
         .set_volume_cb = usb_audio_volume_cb,
         .cb_ctx = NULL,
+
+#if CONFIG_USB_DEVICE_UAC_AS_PART
+        // With our own descriptors, the audio component has to be told
+        // which interfaces carry the audio streams.
+#if CONFIG_UAC_SPEAKER_CHANNEL_NUM > 0
+        .spk_itf_num = ITF_NUM_AUDIO_STREAMING_SPK,
+#endif
+#if CONFIG_UAC_MIC_CHANNEL_NUM > 0
+        .mic_itf_num = ITF_NUM_AUDIO_STREAMING_MIC,
+#endif
+#endif
     };
 
     ESP_ERROR_CHECK(uac_device_init(&config));
 
-    ESP_LOGI(TAG, "USB Audio initialized");
+#if CONFIG_USB_DEVICE_UAC_AS_PART
+    // The USB stack is running: the log can now go to the USB serial port.
+    usb_serial_log_usb_started();
+
+    ESP_LOGI(TAG, "USB Audio initialized, log also on the USB serial port");
+#else
+    ESP_LOGI(TAG, "USB Audio initialized (no USB serial port: "
+                  "CONFIG_USB_DEVICE_UAC_AS_PART is off)");
+#endif
 }
 
 
@@ -777,6 +816,12 @@ static void status_led_task(void *arg)
 
 void app_main(void)
 {
+#if CONFIG_USB_DEVICE_UAC_AS_PART
+    // Start keeping the log so the start-up messages can be replayed on the
+    // USB serial port when a terminal connects.
+    usb_serial_log_install();
+#endif
+
     ESP_LOGI(TAG, "======================================");
     ESP_LOGI(TAG, "ESP32-S3 / MAX98390 USB AUDIO");
     ESP_LOGI(TAG, "======================================");
