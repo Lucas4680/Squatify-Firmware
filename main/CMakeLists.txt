@@ -1,5 +1,8 @@
 idf_component_register(
-    SRCS "i2s_usb_example_main.c"
+    SRCS
+        "i2s_usb_example_main.c"
+        "max98390.c"
+        "speaker_dsp.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_driver_i2s
