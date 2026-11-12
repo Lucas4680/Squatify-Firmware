@@ -12,6 +12,8 @@ idf_component_register(
         esp_driver_gpio
         esp_timer
         usb_device_uac
+    LDFRAGMENTS
+        "linker.lf"
 )
 
 # The speaker processing runs floating-point maths on every sample and has

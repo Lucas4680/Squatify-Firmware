@@ -15,6 +15,7 @@
 #include "driver/gpio.h"
 
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_timer.h"
 
@@ -132,15 +133,11 @@ _Static_assert(CONFIG_UAC_BYTES_PER_SAMPLE * 8 == AUDIO_BITS,
 // TASK CONFIGURATION
 // ============================================================
 
-#define AUDIO_I2S_TASK_STACK    4096
+#define AUDIO_I2S_TASK_STACK    6144
 #define AUDIO_I2S_TASK_PRIORITY 24
 
-// The monitor only prints the log. It must stay below the USB and audio
-// tasks (priority 5 in the usb_device_uac component): each millisecond of
-// audio has to be processed before the next one arrives, and a log task at
-// the same priority can hold that up and cause a click.
 #define MONITOR_TASK_STACK      4096
-#define MONITOR_TASK_PRIORITY   2
+#define MONITOR_TASK_PRIORITY   5
 
 #define STATUS_TASK_STACK       2048
 #define STATUS_TASK_PRIORITY    1
@@ -193,18 +190,20 @@ static volatile uint32_t audio_packets_dropped = 0;
 static volatile uint32_t audio_i2s_errors = 0;
 static volatile uint32_t audio_short_writes = 0;
 
-// Time spent processing audio, to show how much margin is left. Each USB
-// block has to be finished before the next one arrives.
+// Time spent processing audio, to show how much margin is left.
 static volatile uint32_t audio_dsp_busy_us = 0;     // total since start
 static volatile uint32_t audio_dsp_worst_us = 0;    // slowest block since last report
 static volatile uint32_t audio_dsp_block_us = 0;    // how much audio one block holds
+
+// Most blocks that were waiting in the queue at once since the last report.
+static volatile uint32_t audio_queue_peak = 0;
 
 
 // ============================================================
 // VOLUME STATE
 // ============================================================
 //
-// The USB callbacks only change the target gain. The audio callback moves
+// The USB callbacks only change the target gain. The audio task moves
 // the current gain toward it one sample at a time, so the USB control path
 // can never put a step into the waveform.
 
@@ -213,7 +212,7 @@ static volatile float volume_target_db = 0.0f;
 static volatile uint32_t volume_percent = 100;
 static volatile uint32_t volume_muted = 0;
 
-// Only modified by the audio callback.
+// Only modified by the audio task.
 static float volume_current_gain = 1.0f;
 
 
@@ -267,7 +266,7 @@ static float volume_to_gain(uint32_t volume)
 
 
 // Moves the current gain toward the target gain, one small step per sample.
-static inline float volume_process_gain(void)
+static inline __attribute__((always_inline)) float volume_process_gain(void)
 {
     const float target = volume_target_gain;
 
@@ -308,7 +307,7 @@ static inline float volume_process_gain(void)
 // FLOAT -> INT16
 // ============================================================
 
-static inline int16_t float_to_int16(float value)
+static inline __attribute__((always_inline)) int16_t float_to_int16(float value)
 {
     if (value > 0.999969f) {
         value = 0.999969f;
@@ -413,8 +412,64 @@ static void audio_buffer_init(void)
 
 
 // ============================================================
-// I2S AUDIO TASK
+// AUDIO PROCESSING
 // ============================================================
+//
+//     USB stereo
+//         |
+//     INT16 -> FLOAT
+//         |
+//     Stereo -> Mono
+//         |
+//     Smooth volume ramp
+//         |
+//     Speaker processing (speaker_dsp.c):
+//         virtual bass, protection high-pass, EQ, bass/excursion limiter,
+//         peak limiter, power budget
+//         |
+//     FLOAT -> INT16
+//         |
+//     Mono -> L/R
+//
+// Works on one block in place. Kept in internal RAM (IRAM_ATTR here, and
+// main/linker.lf for speaker_dsp.c) so its speed does not depend on the
+// flash cache, which the two processor cores share with everything else.
+
+static void IRAM_ATTR audio_process_block(uint8_t *data, size_t len)
+{
+    for (size_t offset = 0; offset < len; offset += AUDIO_FRAME_BYTES) {
+
+        int16_t left;
+        int16_t right;
+
+        memcpy(&left, &data[offset], sizeof(left));
+        memcpy(&right, &data[offset + 2], sizeof(right));
+
+        // Stereo -> mono.
+        float mono_f = ((float)left + (float)right) * (0.5f / 32768.0f);
+
+        // Volume first, so the protection only works when it is loud.
+        mono_f *= volume_process_gain();
+
+        // EQ and speaker protection.
+        mono_f = speaker_dsp_process(mono_f);
+
+        const int16_t mono = float_to_int16(mono_f);
+
+        // Mono -> L/R.
+        memcpy(&data[offset], &mono, sizeof(mono));
+        memcpy(&data[offset + 2], &mono, sizeof(mono));
+    }
+}
+
+
+// ============================================================
+// AUDIO TASK: PROCESS, THEN I2S
+// ============================================================
+//
+// The USB side only drops raw blocks into the queue. All the processing
+// happens here, so a block that takes longer than usual just waits in the
+// queue for a moment instead of being overwritten by the next USB packet.
 
 static void audio_i2s_task(void *arg)
 {
@@ -431,6 +486,22 @@ static void audio_i2s_task(void *arg)
         if (block.len == 0) {
             continue;
         }
+
+        // Volume, EQ and speaker protection, timed for the LOAD log line.
+        const int64_t t_start = esp_timer_get_time();
+
+        audio_process_block(block.data, block.len);
+
+        const uint32_t t_used = (uint32_t)(esp_timer_get_time() - t_start);
+
+        audio_dsp_busy_us += t_used;
+
+        if (t_used > audio_dsp_worst_us) {
+            audio_dsp_worst_us = t_used;
+        }
+
+        audio_dsp_block_us =
+            (uint32_t)((block.len / AUDIO_FRAME_BYTES) * 1000000ULL / SAMPLE_RATE);
 
         size_t offset = 0;
 
@@ -470,23 +541,10 @@ static void audio_i2s_task(void *arg)
 // USB AUDIO OUTPUT CALLBACK
 // ============================================================
 //
-//     USB stereo
-//         |
-//     INT16 -> FLOAT
-//         |
-//     Stereo -> Mono
-//         |
-//     Smooth volume ramp
-//         |
-//     Speaker processing (speaker_dsp.c):
-//         protection high-pass, EQ, bass/excursion limiter,
-//         peak limiter, power budget
-//         |
-//     FLOAT -> INT16
-//         |
-//     Mono -> L/R
-//         |
-//     I2S
+// Called by the usb_device_uac component for every millisecond of audio.
+// The component reuses one buffer for the next packet, so this must return
+// quickly: it only copies the raw block into the queue. The audio task does
+// the processing (see audio_process_block).
 
 static esp_err_t usb_audio_output_cb(uint8_t *buf, size_t len, void *arg)
 {
@@ -513,43 +571,6 @@ static esp_err_t usb_audio_output_cb(uint8_t *buf, size_t len, void *arg)
         return ESP_OK;
     }
 
-    const int64_t t_start = esp_timer_get_time();
-
-    for (size_t offset = 0; offset < len; offset += AUDIO_FRAME_BYTES) {
-
-        int16_t left;
-        int16_t right;
-
-        memcpy(&left, &buf[offset], sizeof(left));
-        memcpy(&right, &buf[offset + 2], sizeof(right));
-
-        // Stereo -> mono.
-        float mono_f = ((float)left + (float)right) * (0.5f / 32768.0f);
-
-        // Volume first, so the protection only works when it is loud.
-        mono_f *= volume_process_gain();
-
-        // EQ and speaker protection.
-        mono_f = speaker_dsp_process(mono_f);
-
-        const int16_t mono = float_to_int16(mono_f);
-
-        // Mono -> L/R.
-        memcpy(&buf[offset], &mono, sizeof(mono));
-        memcpy(&buf[offset + 2], &mono, sizeof(mono));
-    }
-
-    const uint32_t t_used = (uint32_t)(esp_timer_get_time() - t_start);
-
-    audio_dsp_busy_us += t_used;
-
-    if (t_used > audio_dsp_worst_us) {
-        audio_dsp_worst_us = t_used;
-    }
-
-    audio_dsp_block_us =
-        (uint32_t)((len / AUDIO_FRAME_BYTES) * 1000000ULL / SAMPLE_RATE);
-
     audio_block_t block;
 
     block.len = len;
@@ -563,6 +584,12 @@ static esp_err_t usb_audio_output_cb(uint8_t *buf, size_t len, void *arg)
 
     audio_packets_received++;
     audio_bytes_received += len;
+
+    const uint32_t waiting = (uint32_t)uxQueueMessagesWaiting(audio_queue);
+
+    if (waiting > audio_queue_peak) {
+        audio_queue_peak = waiting;
+    }
 
     return ESP_OK;
 }
@@ -737,14 +764,17 @@ static void audio_monitor_task(void *arg)
                  errors, errors - last_errors,
                  short_writes, short_writes - last_short);
 
-        // How much processor time the audio processing needs. "worst" is the
-        // slowest block against the length of audio it holds: if the two
-        // come close, blocks start to overlap and the sound clicks.
+        // How much processor time the audio processing needs. The average
+        // has to stay well below 100 %. A single slow block is harmless as
+        // long as "queue peak" stays far from the queue length: the queue
+        // and the I2S buffer cover it.
         const uint32_t busy_us = audio_dsp_busy_us;
         const uint32_t worst_us = audio_dsp_worst_us;
+        const uint32_t queue_peak = audio_queue_peak;
         const int64_t now_us = esp_timer_get_time();
 
         audio_dsp_worst_us = 0;
+        audio_queue_peak = 0;
 
         uint32_t span_us = (uint32_t)(now_us - last_time_us);
 
@@ -753,9 +783,11 @@ static void audio_monitor_task(void *arg)
         }
 
         ESP_LOGI(TAG,
-                 "LOAD: audio processing %.1f %%  worst block %" PRIu32 " us of %" PRIu32 " us",
+                 "LOAD: audio processing %.1f %%  slowest block %" PRIu32 " us "
+                 "(a block holds %" PRIu32 " us)  queue peak %" PRIu32 "/%u",
                  100.0f * (float)(busy_us - last_busy_us) / (float)span_us,
-                 worst_us, (uint32_t)audio_dsp_block_us);
+                 worst_us, (uint32_t)audio_dsp_block_us,
+                 queue_peak, (unsigned)AUDIO_QUEUE_LENGTH);
 
         last_busy_us = busy_us;
         last_time_us = now_us;

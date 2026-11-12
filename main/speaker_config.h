@@ -87,12 +87,15 @@
 // SPK_VBASS_GAIN_DB sets how loud the overtones are compared with the note
 // they stand in for: 0 = about the same level, -6 = subtle, +6 = heavy.
 // SPK_VBASS_H2/H3/H4 set the mix of the three overtones.
+// SPK_VBASS_HIGH_HZ is where the overtones fade out and the real note takes
+// over. Raising it gives a fuller sound but doubles up with the real bass
+// around 80-95 Hz, which is heard as a bump there.
 // Set SPK_VBASS_ENABLE to 0 to switch the stage off.
 
 #define SPK_VBASS_ENABLE            1
 
 #define SPK_VBASS_LOW_HZ            30.0f       // lowest note that is converted
-#define SPK_VBASS_HIGH_HZ           85.0f       // notes above this are played for real
+#define SPK_VBASS_HIGH_HZ           75.0f       // notes above this are played for real
 
 #define SPK_VBASS_GAIN_DB           0.0f
 
@@ -179,8 +182,8 @@
 //
 //   - at low and normal volume (up to roughly 70 % on the PC) it is fully
 //     on: the bass is lifted by SPK_XBASS_SHELF_DB below about
-//     SPK_XBASS_SHELF_HZ, and the response holds up to about 83 Hz instead
-//     of 89 Hz (-3 dB points). An 80 Hz note comes out about 7 dB louder;
+//     SPK_XBASS_SHELF_HZ, and the response holds up to about 86 Hz instead
+//     of 89 Hz (-3 dB points). An 80 Hz note comes out about 5 dB louder;
 //   - as the volume goes up it is the first thing to give way, before the
 //     normal bass band or anything else is turned down. Near full volume it
 //     is off and the speaker behaves exactly as it did without this stage:
@@ -188,19 +191,23 @@
 //
 // The log shows it as "extra bass=NN %".
 //
-// SPK_XBASS_SHELF_DB is the taste control: 0 = no lift, 3 = default,
-// 6 = heavy. SPK_XBASS_PEAK_* is the extension toward 80 Hz. Keep the Q at 3
-// or below: a sharper peak only works if the real box matches the model to
-// within a couple of hertz.
+// SPK_XBASS_SHELF_DB is the taste control for the whole bass lift: 0 = no
+// lift, 2.5 = default, 6 = heavy.
+//
+// SPK_XBASS_PEAK_DB is the extension toward 80 Hz. It acts mostly between
+// 75 and 95 Hz, so it is the one to turn down if a sweep is louder around
+// 90 Hz than around 120 Hz (0 = no extension). Keep the Q at 3 or below: a
+// sharper peak only works if the real box matches the model to within a
+// couple of hertz.
 
 #define SPK_XBASS_ENABLE            1
 
 #define SPK_XBASS_SHELF_HZ          125.0f
-#define SPK_XBASS_SHELF_DB          3.0f
+#define SPK_XBASS_SHELF_DB          2.5f
 #define SPK_XBASS_SHELF_SLOPE       0.8f
 
 #define SPK_XBASS_PEAK_HZ           78.0f
-#define SPK_XBASS_PEAK_DB           5.0f
+#define SPK_XBASS_PEAK_DB           3.0f
 #define SPK_XBASS_PEAK_Q            3.0f
 
 #define SPK_XBASS_RELEASE_S         0.40f

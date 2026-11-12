@@ -470,7 +470,7 @@ float speaker_dsp_process(float x)
         }
 
         // No clean-up filter is needed after this: the low notes are below
-        // 85 Hz, so nothing above their 4th overtone (340 Hz) is made, and
+        // SPK_VBASS_HIGH_HZ, so nothing above four times that is made, and
         // the protection high-pass that follows removes what lands too low.
         x += vb_gain * h;
     }
