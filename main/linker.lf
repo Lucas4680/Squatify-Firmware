@@ -1,0 +1,12 @@
+# Keep the speaker processing in internal RAM instead of flash.
+#
+# Code that runs from flash goes through a small cache that both processor
+# cores share. When the other core prints the log, the processing code gets
+# pushed out of that cache and has to be fetched again, and a block of audio
+# that normally takes 0.4 ms can take over 1 ms. From internal RAM its speed
+# is always the same.
+
+[mapping:speaker_dsp]
+archive: libmain.a
+entries:
+    speaker_dsp (noflash)
