@@ -89,6 +89,7 @@
 // Fitted to the model of this driver, radiator and box so the response is
 // flat from about 95 Hz upward (within 0.1 dB in the model, 100-600 Hz).
 // Nothing above 600 Hz is corrected: the simple model is not valid there.
+// The EXTRA BASS section further down adds to this while there is room.
 
 #define SPK_EQ_SHELF_HZ             154.0f
 #define SPK_EQ_SHELF_DB             11.9f
@@ -127,6 +128,53 @@
 #define SPK_XLIM_HOLD               960         // samples (20 ms)
 #define SPK_XLIM_RELEASE_S          0.20f
 #define SPK_XLIM_MIN_GAIN           0.05f
+
+
+// ============================================================
+// EXTRA BASS (ONLY WHILE THERE IS ROOM FOR IT)
+// ============================================================
+//
+// What this box can do, from the model (loudest clean level at 1 m):
+//
+//     600 Hz  83 dB     100 Hz  77 dB     80 Hz  68 dB     60 Hz  52 dB
+//
+// Below about 80 Hz the radiator cancels the cone and the output falls off a
+// cliff, so no amount of boost gives real 40-60 Hz. What can be done is to
+// carry the response a little lower and lift the bass, as long as the cone,
+// the radiator and the power budget have room. That is what this stage is.
+//
+// It is an extra filter on the bass band whose added part has its own gain:
+//
+//   - at low and normal volume (up to roughly 70 % on the PC) it is fully
+//     on: the bass is lifted by SPK_XBASS_SHELF_DB below about
+//     SPK_XBASS_SHELF_HZ, and the response holds up to about 83 Hz instead
+//     of 89 Hz (-3 dB points). An 80 Hz note comes out about 7 dB louder;
+//   - as the volume goes up it is the first thing to give way, before the
+//     normal bass band or anything else is turned down. Near full volume it
+//     is off and the speaker behaves exactly as it did without this stage:
+//     there the bass is already at what the cone and the power budget allow.
+//
+// The log shows it as "extra bass=NN %".
+//
+// SPK_XBASS_SHELF_DB is the taste control: 0 = no lift, 3 = default,
+// 6 = heavy. SPK_XBASS_PEAK_* is the extension toward 80 Hz. Keep the Q at 3
+// or below: a sharper peak only works if the real box matches the model to
+// within a couple of hertz.
+
+#define SPK_XBASS_ENABLE            1
+
+#define SPK_XBASS_SHELF_HZ          125.0f
+#define SPK_XBASS_SHELF_DB          3.0f
+#define SPK_XBASS_SHELF_SLOPE       0.8f
+
+#define SPK_XBASS_PEAK_HZ           78.0f
+#define SPK_XBASS_PEAK_DB           5.0f
+#define SPK_XBASS_PEAK_Q            3.0f
+
+#define SPK_XBASS_RELEASE_S         0.40f
+
+// The extra bass starts giving way at this fraction of the power budget.
+#define SPK_XBASS_POWER_FRAC        0.80f
 
 
 // ============================================================

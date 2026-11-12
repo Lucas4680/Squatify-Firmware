@@ -295,6 +295,16 @@ static float dl_low[SPK_XLIM_LOOKAHEAD];
 static float dl_high[SPK_XLIM_LOOKAHEAD];
 static uint32_t dl_x_pos;
 
+#if SPK_XBASS_ENABLE
+static biquad_t xb1;            // extra bass: lift below about 125 Hz
+static biquad_t xb2;            // extra bass: extension toward 80 Hz
+static spk_model_t m_xb;        // predicts what the extra bass would add
+static gain_follower_t gf_xb;
+static float dl_xb[SPK_XLIM_LOOKAHEAD];
+static float xb_pw_gain;        // slow gain: gives way to the power budget first
+static float xb_pw_limit;       // power level where the extra bass starts giving way
+#endif
+
 static gain_follower_t gf_peak;
 static float dl_peak[SPK_PEAK_LOOKAHEAD];
 static uint32_t dl_p_pos;
@@ -315,6 +325,7 @@ static void stats_restart(void)
     st.xp_peak_mm = 0.0f;
     st.out_peak_v = 0.0f;
     st.bass_gain_min = 1.0f;
+    st.xbass_gain_min = 1.0f;
     st.peak_gain_min = 1.0f;
     st.clamped = 0;
 }
@@ -361,6 +372,19 @@ void speaker_dsp_init(void)
     memset(dl_low, 0, sizeof(dl_low));
     memset(dl_high, 0, sizeof(dl_high));
     dl_x_pos = 0;
+
+#if SPK_XBASS_ENABLE
+    biquad_lowshelf(&xb1, SPK_XBASS_SHELF_HZ, SPK_XBASS_SHELF_DB, SPK_XBASS_SHELF_SLOPE);
+    biquad_peak(&xb2, SPK_XBASS_PEAK_HZ, SPK_XBASS_PEAK_DB, SPK_XBASS_PEAK_Q);
+
+    memset(&m_xb, 0, sizeof(m_xb));
+
+    gain_follower_init(&gf_xb, SPK_XLIM_LOOKAHEAD, SPK_XLIM_HOLD, SPK_XBASS_RELEASE_S);
+    memset(dl_xb, 0, sizeof(dl_xb));
+
+    xb_pw_gain = 1.0f;
+    xb_pw_limit = SPK_POWER_BUDGET_W * SPK_XBASS_POWER_FRAC;
+#endif
 
     gain_follower_init(&gf_peak, SPK_PEAK_LOOKAHEAD, SPK_PEAK_HOLD, SPK_PEAK_RELEASE_S);
     memset(dl_peak, 0, sizeof(dl_peak));
@@ -420,9 +444,13 @@ float speaker_dsp_process(float x)
 
     model_step(&m_high, high_v * SPK_AMP_FULL_SCALE_VPEAK);
 
+    // Travel left for the bass once the upper band has taken its share.
+    const float room_d = xd_limit - fabsf(m_high.xd);
+    const float room_p = xp_limit - fabsf(m_high.xp);
+
     r = 1.0f;
 
-    float head = xd_limit - fabsf(m_high.xd);
+    float head = room_d;
     if (head < xd_floor) {
         head = xd_floor;
     }
@@ -432,7 +460,7 @@ float speaker_dsp_process(float x)
         r = head / a;
     }
 
-    head = xp_limit - fabsf(m_high.xp);
+    head = room_p;
     if (head < xp_floor) {
         head = xp_floor;
     }
@@ -453,7 +481,39 @@ float speaker_dsp_process(float x)
 
     const float g_bass = gain_follower_run(&gf_bass, r);
 
-    // 4. Delay both bands so the gain is already down when the peak arrives.
+#if SPK_XBASS_ENABLE
+    // Extra bass: only the part that the extension filter adds to the bass
+    // band. It gets whatever travel and voltage the normal bass band leaves,
+    // so it is the first thing to go when the speaker runs out of room.
+    const float xb = biquad_run(&xb2, biquad_run(&xb1, low)) - low;
+
+    model_step(&m_xb, xb * SPK_AMP_FULL_SCALE_VPEAK);
+
+    float rx = 1.0f;
+    float room;
+
+    room = room_d - r * fabsf(m_low.xd);
+    a = fabsf(m_xb.xd);
+    if (a > room) {
+        rx = (room > 0.0f) ? room / a : 0.0f;
+    }
+
+    room = room_p - r * fabsf(m_low.xp);
+    a = fabsf(m_xb.xp);
+    if (a * rx > room) {
+        rx = (room > 0.0f) ? room / a : 0.0f;
+    }
+
+    room = low_ceiling - r * fabsf(low);
+    a = fabsf(xb);
+    if (a * rx > room) {
+        rx = (room > 0.0f) ? room / a : 0.0f;
+    }
+
+    const float g_xb = gain_follower_run(&gf_xb, rx) * xb_pw_gain;
+#endif
+
+    // 4. Delay the bands so the gains are already down when the peak arrives.
     pos = dl_x_pos;
 
     const float low_d = dl_low[pos];
@@ -462,13 +522,23 @@ float speaker_dsp_process(float x)
     dl_low[pos] = low;
     dl_high[pos] = high;
 
+#if SPK_XBASS_ENABLE
+    const float xb_d = dl_xb[pos];
+
+    dl_xb[pos] = xb;
+#endif
+
     pos++;
     if (pos >= SPK_XLIM_LOOKAHEAD) {
         pos = 0;
     }
     dl_x_pos = pos;
 
+#if SPK_XBASS_ENABLE
+    const float y = g_bass * low_d + g_xb * xb_d + high_d;
+#else
     const float y = g_bass * low_d + high_d;
+#endif
 
     // 5. Look-ahead peak limiter to the amplifier ceiling.
     a = fabsf(y);
@@ -542,6 +612,17 @@ float speaker_dsp_process(float x)
             pw_gain = 1.0f;
         }
 
+#if SPK_XBASS_ENABLE
+        // The extra bass backs off before the budget is reached, so the
+        // budget gain above rarely has to turn the whole signal down for it.
+        if (pw_avg > xb_pw_limit) {
+            xb_pw_gain -= xb_pw_gain * pw_attack;
+        }
+        else {
+            xb_pw_gain += (1.0f - xb_pw_gain) * pw_release;
+        }
+#endif
+
         st.power_avg_w = pw_avg;
         st.power_gain = pw_gain;
     }
@@ -569,6 +650,12 @@ float speaker_dsp_process(float x)
     if (g_peak < st.peak_gain_min) {
         st.peak_gain_min = g_peak;
     }
+
+#if SPK_XBASS_ENABLE
+    if (g_xb < st.xbass_gain_min) {
+        st.xbass_gain_min = g_xb;
+    }
+#endif
 
     return out;
 }

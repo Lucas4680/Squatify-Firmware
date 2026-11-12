@@ -10,12 +10,15 @@
 //         |
 //     split at 250 Hz ------------------------.
 //         |                                   |
-//     bass band                           mid/high band
-//         |                                   |
+//     bass band ---> extra bass               mid/high band
+//         |          (lift + extension,       |
+//         |           own gain: first         |
+//         |           to give way)            |
+//         |               |                   |
 //     speaker model predicts excursion        |
 //     bass gain (look-ahead)                  |
-//         |                                   |
-//         '----------------- sum -------------'
+//         |               |                   |
+//         '---------------'----- sum ---------'
 //                             |
 //                    look-ahead peak limiter
 //                             |
@@ -41,6 +44,7 @@ typedef struct {
     float out_peak_v;       // largest output voltage requested
     float power_avg_w;      // average electrical power into the speaker
     float bass_gain_min;    // lowest bass-band gain (1.0 = not limiting)
+    float xbass_gain_min;   // lowest extra-bass gain (1.0 = fully on, 0.0 = off)
     float peak_gain_min;    // lowest peak-limiter gain (1.0 = not limiting)
     float power_gain;       // current power-budget gain (1.0 = not limiting)
     uint32_t clamped;       // samples that reached the safety clamp
