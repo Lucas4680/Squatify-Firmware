@@ -4,6 +4,9 @@
 //
 //     input (after volume)
 //         |
+//     virtual bass: overtones of the notes below about 85 Hz are added,
+//     because the box cannot play those notes themselves
+//         |
 //     80 Hz protection high-pass
 //         |
 //     response EQ + voicing shelf

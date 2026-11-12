@@ -73,6 +73,38 @@
 
 
 // ============================================================
+// VIRTUAL BASS (NOTES BELOW WHAT THE BOX CAN PLAY)
+// ============================================================
+//
+// Notes between about 30 and 85 Hz cannot come out of this box as
+// themselves (see EXTRA BASS below). When the ear is given the overtones of
+// a low note (2x, 3x, 4x its frequency) it still hears the low note. The
+// first firmware did this by accident: its +15 dB boost drove the amplifier
+// into clipping, and a 55 Hz note came out about 17 dB louder at 165 Hz than
+// at 55 Hz. This stage makes the overtones on purpose, cleanly, and before
+// the limiters, so the cone and the supply stay inside their limits.
+//
+// SPK_VBASS_GAIN_DB sets how loud the overtones are compared with the note
+// they stand in for: 0 = about the same level, -6 = subtle, +6 = heavy.
+// SPK_VBASS_H2/H3/H4 set the mix of the three overtones.
+// Set SPK_VBASS_ENABLE to 0 to switch the stage off.
+
+#define SPK_VBASS_ENABLE            1
+
+#define SPK_VBASS_LOW_HZ            30.0f       // lowest note that is converted
+#define SPK_VBASS_HIGH_HZ           85.0f       // notes above this are played for real
+
+#define SPK_VBASS_GAIN_DB           0.0f
+
+#define SPK_VBASS_H2                0.60f       // 2x the note
+#define SPK_VBASS_H3                0.40f       // 3x the note
+#define SPK_VBASS_H4                0.20f       // 4x the note
+
+// How fast the level detector lets go after a note ends.
+#define SPK_VBASS_RELEASE_S         0.12f
+
+
+// ============================================================
 // PROTECTION HIGH-PASS
 // ============================================================
 //

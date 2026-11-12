@@ -278,6 +278,15 @@ static biquad_t lp2;            // split low-pass, section 2
 static biquad_t sh1;            // split high-pass, section 1
 static biquad_t sh2;            // split high-pass, section 2
 
+#if SPK_VBASS_ENABLE
+static biquad_t vb_in1;         // virtual bass: keep only the notes too low to play
+static biquad_t vb_in2;
+static biquad_t vb_in3;
+static float vb_env;           // level of the low notes right now
+static float vb_env_decay;
+static float vb_gain;
+#endif
+
 static spk_model_t m_low;       // predicts what the bass band would do
 static spk_model_t m_high;      // predicts what the upper band would do
 static spk_model_t m_out;       // follows what is really sent to the amp
@@ -340,6 +349,17 @@ void speaker_dsp_init(void)
     const double fs = (double)SPK_SAMPLE_RATE_HZ;
 
     model_init();
+
+#if SPK_VBASS_ENABLE
+    // Low notes only: 4th-order low-pass, then a high-pass for rumble.
+    biquad_lowpass(&vb_in1, SPK_VBASS_HIGH_HZ, 0.54119610);
+    biquad_lowpass(&vb_in2, SPK_VBASS_HIGH_HZ, 1.30656296);
+    biquad_highpass(&vb_in3, SPK_VBASS_LOW_HZ, 0.70710678);
+
+    vb_env = 0.0f;
+    vb_env_decay = (float)exp(-1.0 / ((double)SPK_VBASS_RELEASE_S * fs));
+    vb_gain = (float)pow(10.0, (double)SPK_VBASS_GAIN_DB / 20.0);
+#endif
 
     // 4th-order Butterworth high-pass = two sections with these Q values.
     biquad_highpass(&hp1, SPK_HPF_HZ, 0.54119610);
@@ -416,6 +436,45 @@ float speaker_dsp_process(float x)
     if (!isfinite(x)) {
         x = 0.0f;
     }
+
+#if SPK_VBASS_ENABLE
+    // 0. Virtual bass: make the overtones of the notes that are too low for
+    //    the box. They are added here, ahead of everything else, so the EQ
+    //    shapes them and the limiters below treat them like any other bass.
+    {
+        const float s =
+            biquad_run(&vb_in3, biquad_run(&vb_in2, biquad_run(&vb_in1, x)));
+
+        // Level of the low notes: jumps up at once, falls back slowly.
+        vb_env *= vb_env_decay;
+
+        a = fabsf(s);
+        if (a > vb_env) {
+            vb_env = a;
+        }
+
+        float h = 0.0f;
+
+        if (vb_env > 1e-6f) {
+
+            // The note scaled to -1..1, so the overtone mix does not depend
+            // on how loud the note is.
+            const float u = s / vb_env;
+            const float u2 = u * u;
+
+            // Chebyshev polynomials: a sine in gives exactly its 2nd, 3rd
+            // and 4th overtone out.
+            h = vb_env * (SPK_VBASS_H2 * (2.0f * u2 - 1.0f)
+                          + SPK_VBASS_H3 * u * (4.0f * u2 - 3.0f)
+                          + SPK_VBASS_H4 * (8.0f * u2 * (u2 - 1.0f) + 1.0f));
+        }
+
+        // No clean-up filter is needed after this: the low notes are below
+        // 85 Hz, so nothing above their 4th overtone (340 Hz) is made, and
+        // the protection high-pass that follows removes what lands too low.
+        x += vb_gain * h;
+    }
+#endif
 
     // 1. Protection high-pass and EQ.
     x = biquad_run(&hp2, biquad_run(&hp1, x));
