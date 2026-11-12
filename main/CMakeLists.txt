@@ -10,8 +10,15 @@ idf_component_register(
         esp_driver_i2s
         esp_driver_i2c
         esp_driver_gpio
+        esp_timer
         usb_device_uac
 )
+
+# The speaker processing runs floating-point maths on every sample and has
+# to finish each millisecond of audio before the next arrives. Build this
+# component with -O2 whatever optimization level the project is set to (the
+# ESP-IDF default, -Og, makes it several times slower).
+target_compile_options(${COMPONENT_LIB} PRIVATE -O2)
 
 # USB speaker + serial log port on the same cable.
 #

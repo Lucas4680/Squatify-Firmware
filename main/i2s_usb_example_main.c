@@ -16,6 +16,7 @@
 
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 
 #include "usb_device_uac.h"
 
@@ -134,8 +135,12 @@ _Static_assert(CONFIG_UAC_BYTES_PER_SAMPLE * 8 == AUDIO_BITS,
 #define AUDIO_I2S_TASK_STACK    4096
 #define AUDIO_I2S_TASK_PRIORITY 24
 
+// The monitor only prints the log. It must stay below the USB and audio
+// tasks (priority 5 in the usb_device_uac component): each millisecond of
+// audio has to be processed before the next one arrives, and a log task at
+// the same priority can hold that up and cause a click.
 #define MONITOR_TASK_STACK      4096
-#define MONITOR_TASK_PRIORITY   5
+#define MONITOR_TASK_PRIORITY   2
 
 #define STATUS_TASK_STACK       2048
 #define STATUS_TASK_PRIORITY    1
@@ -187,6 +192,12 @@ static volatile uint32_t audio_bytes_received = 0;
 static volatile uint32_t audio_packets_dropped = 0;
 static volatile uint32_t audio_i2s_errors = 0;
 static volatile uint32_t audio_short_writes = 0;
+
+// Time spent processing audio, to show how much margin is left. Each USB
+// block has to be finished before the next one arrives.
+static volatile uint32_t audio_dsp_busy_us = 0;     // total since start
+static volatile uint32_t audio_dsp_worst_us = 0;    // slowest block since last report
+static volatile uint32_t audio_dsp_block_us = 0;    // how much audio one block holds
 
 
 // ============================================================
@@ -502,6 +513,8 @@ static esp_err_t usb_audio_output_cb(uint8_t *buf, size_t len, void *arg)
         return ESP_OK;
     }
 
+    const int64_t t_start = esp_timer_get_time();
+
     for (size_t offset = 0; offset < len; offset += AUDIO_FRAME_BYTES) {
 
         int16_t left;
@@ -525,6 +538,17 @@ static esp_err_t usb_audio_output_cb(uint8_t *buf, size_t len, void *arg)
         memcpy(&buf[offset], &mono, sizeof(mono));
         memcpy(&buf[offset + 2], &mono, sizeof(mono));
     }
+
+    const uint32_t t_used = (uint32_t)(esp_timer_get_time() - t_start);
+
+    audio_dsp_busy_us += t_used;
+
+    if (t_used > audio_dsp_worst_us) {
+        audio_dsp_worst_us = t_used;
+    }
+
+    audio_dsp_block_us =
+        (uint32_t)((len / AUDIO_FRAME_BYTES) * 1000000ULL / SAMPLE_RATE);
 
     audio_block_t block;
 
@@ -686,6 +710,8 @@ static void audio_monitor_task(void *arg)
     uint32_t last_dropped = 0;
     uint32_t last_errors = 0;
     uint32_t last_short = 0;
+    uint32_t last_busy_us = 0;
+    int64_t last_time_us = esp_timer_get_time();
 
     while (1) {
 
@@ -711,21 +737,46 @@ static void audio_monitor_task(void *arg)
                  errors, errors - last_errors,
                  short_writes, short_writes - last_short);
 
+        // How much processor time the audio processing needs. "worst" is the
+        // slowest block against the length of audio it holds: if the two
+        // come close, blocks start to overlap and the sound clicks.
+        const uint32_t busy_us = audio_dsp_busy_us;
+        const uint32_t worst_us = audio_dsp_worst_us;
+        const int64_t now_us = esp_timer_get_time();
+
+        audio_dsp_worst_us = 0;
+
+        uint32_t span_us = (uint32_t)(now_us - last_time_us);
+
+        if (span_us == 0) {
+            span_us = 1;
+        }
+
+        ESP_LOGI(TAG,
+                 "LOAD: audio processing %.1f %%  worst block %" PRIu32 " us of %" PRIu32 " us",
+                 100.0f * (float)(busy_us - last_busy_us) / (float)span_us,
+                 worst_us, (uint32_t)audio_dsp_block_us);
+
+        last_busy_us = busy_us;
+        last_time_us = now_us;
+
         // What the speaker processing did during the last second.
         // The gains are 0 dB when a stage is idle and negative when it is
-        // holding something back.
+        // holding something back. "extra bass" is the lowest it went:
+        // 100 % = bass lift fully on, 0 % = given up to stay within limits.
         speaker_dsp_stats_t dsp;
 
         speaker_dsp_read_stats(&dsp);
 
         ESP_LOGI(TAG,
                  "DSP: out=%.2f V  cone=%.2f/%.1f mm  radiator=%.2f/%.1f mm  "
-                 "power=%.2f/%.1f W  bass=%.1f dB  peak=%.1f dB  budget=%.1f dB  "
-                 "clamped=%" PRIu32,
+                 "power=%.2f/%.1f W  extra bass=%.0f %%  bass=%.1f dB  peak=%.1f dB  "
+                 "budget=%.1f dB  clamped=%" PRIu32,
                  dsp.out_peak_v,
                  dsp.xd_peak_mm, SPK_DRV_XMAX_MM,
                  dsp.xp_peak_mm, SPK_PR_XLIMIT_MM,
                  dsp.power_avg_w, SPK_POWER_BUDGET_W,
+                 100.0f * dsp.xbass_gain_min,
                  gain_to_db(dsp.bass_gain_min),
                  gain_to_db(dsp.peak_gain_min),
                  gain_to_db(dsp.power_gain),

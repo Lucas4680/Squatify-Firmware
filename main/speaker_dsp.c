@@ -278,6 +278,15 @@ static biquad_t lp2;            // split low-pass, section 2
 static biquad_t sh1;            // split high-pass, section 1
 static biquad_t sh2;            // split high-pass, section 2
 
+#if SPK_VBASS_ENABLE
+static biquad_t vb_in1;         // virtual bass: keep only the notes too low to play
+static biquad_t vb_in2;
+static biquad_t vb_in3;
+static float vb_env;           // level of the low notes right now
+static float vb_env_decay;
+static float vb_gain;
+#endif
+
 static spk_model_t m_low;       // predicts what the bass band would do
 static spk_model_t m_high;      // predicts what the upper band would do
 static spk_model_t m_out;       // follows what is really sent to the amp
@@ -294,6 +303,16 @@ static gain_follower_t gf_bass;
 static float dl_low[SPK_XLIM_LOOKAHEAD];
 static float dl_high[SPK_XLIM_LOOKAHEAD];
 static uint32_t dl_x_pos;
+
+#if SPK_XBASS_ENABLE
+static biquad_t xb1;            // extra bass: lift below about 125 Hz
+static biquad_t xb2;            // extra bass: extension toward 80 Hz
+static spk_model_t m_xb;        // predicts what the extra bass would add
+static gain_follower_t gf_xb;
+static float dl_xb[SPK_XLIM_LOOKAHEAD];
+static float xb_pw_gain;        // slow gain: gives way to the power budget first
+static float xb_pw_limit;       // power level where the extra bass starts giving way
+#endif
 
 static gain_follower_t gf_peak;
 static float dl_peak[SPK_PEAK_LOOKAHEAD];
@@ -315,6 +334,7 @@ static void stats_restart(void)
     st.xp_peak_mm = 0.0f;
     st.out_peak_v = 0.0f;
     st.bass_gain_min = 1.0f;
+    st.xbass_gain_min = 1.0f;
     st.peak_gain_min = 1.0f;
     st.clamped = 0;
 }
@@ -329,6 +349,17 @@ void speaker_dsp_init(void)
     const double fs = (double)SPK_SAMPLE_RATE_HZ;
 
     model_init();
+
+#if SPK_VBASS_ENABLE
+    // Low notes only: 4th-order low-pass, then a high-pass for rumble.
+    biquad_lowpass(&vb_in1, SPK_VBASS_HIGH_HZ, 0.54119610);
+    biquad_lowpass(&vb_in2, SPK_VBASS_HIGH_HZ, 1.30656296);
+    biquad_highpass(&vb_in3, SPK_VBASS_LOW_HZ, 0.70710678);
+
+    vb_env = 0.0f;
+    vb_env_decay = (float)exp(-1.0 / ((double)SPK_VBASS_RELEASE_S * fs));
+    vb_gain = (float)pow(10.0, (double)SPK_VBASS_GAIN_DB / 20.0);
+#endif
 
     // 4th-order Butterworth high-pass = two sections with these Q values.
     biquad_highpass(&hp1, SPK_HPF_HZ, 0.54119610);
@@ -362,6 +393,19 @@ void speaker_dsp_init(void)
     memset(dl_high, 0, sizeof(dl_high));
     dl_x_pos = 0;
 
+#if SPK_XBASS_ENABLE
+    biquad_lowshelf(&xb1, SPK_XBASS_SHELF_HZ, SPK_XBASS_SHELF_DB, SPK_XBASS_SHELF_SLOPE);
+    biquad_peak(&xb2, SPK_XBASS_PEAK_HZ, SPK_XBASS_PEAK_DB, SPK_XBASS_PEAK_Q);
+
+    memset(&m_xb, 0, sizeof(m_xb));
+
+    gain_follower_init(&gf_xb, SPK_XLIM_LOOKAHEAD, SPK_XLIM_HOLD, SPK_XBASS_RELEASE_S);
+    memset(dl_xb, 0, sizeof(dl_xb));
+
+    xb_pw_gain = 1.0f;
+    xb_pw_limit = SPK_POWER_BUDGET_W * SPK_XBASS_POWER_FRAC;
+#endif
+
     gain_follower_init(&gf_peak, SPK_PEAK_LOOKAHEAD, SPK_PEAK_HOLD, SPK_PEAK_RELEASE_S);
     memset(dl_peak, 0, sizeof(dl_peak));
     dl_p_pos = 0;
@@ -393,6 +437,45 @@ float speaker_dsp_process(float x)
         x = 0.0f;
     }
 
+#if SPK_VBASS_ENABLE
+    // 0. Virtual bass: make the overtones of the notes that are too low for
+    //    the box. They are added here, ahead of everything else, so the EQ
+    //    shapes them and the limiters below treat them like any other bass.
+    {
+        const float s =
+            biquad_run(&vb_in3, biquad_run(&vb_in2, biquad_run(&vb_in1, x)));
+
+        // Level of the low notes: jumps up at once, falls back slowly.
+        vb_env *= vb_env_decay;
+
+        a = fabsf(s);
+        if (a > vb_env) {
+            vb_env = a;
+        }
+
+        float h = 0.0f;
+
+        if (vb_env > 1e-6f) {
+
+            // The note scaled to -1..1, so the overtone mix does not depend
+            // on how loud the note is.
+            const float u = s / vb_env;
+            const float u2 = u * u;
+
+            // Chebyshev polynomials: a sine in gives exactly its 2nd, 3rd
+            // and 4th overtone out.
+            h = vb_env * (SPK_VBASS_H2 * (2.0f * u2 - 1.0f)
+                          + SPK_VBASS_H3 * u * (4.0f * u2 - 3.0f)
+                          + SPK_VBASS_H4 * (8.0f * u2 * (u2 - 1.0f) + 1.0f));
+        }
+
+        // No clean-up filter is needed after this: the low notes are below
+        // 85 Hz, so nothing above their 4th overtone (340 Hz) is made, and
+        // the protection high-pass that follows removes what lands too low.
+        x += vb_gain * h;
+    }
+#endif
+
     // 1. Protection high-pass and EQ.
     x = biquad_run(&hp2, biquad_run(&hp1, x));
     x = biquad_run(&eq3, biquad_run(&eq2, biquad_run(&eq1, x)));
@@ -420,9 +503,13 @@ float speaker_dsp_process(float x)
 
     model_step(&m_high, high_v * SPK_AMP_FULL_SCALE_VPEAK);
 
+    // Travel left for the bass once the upper band has taken its share.
+    const float room_d = xd_limit - fabsf(m_high.xd);
+    const float room_p = xp_limit - fabsf(m_high.xp);
+
     r = 1.0f;
 
-    float head = xd_limit - fabsf(m_high.xd);
+    float head = room_d;
     if (head < xd_floor) {
         head = xd_floor;
     }
@@ -432,7 +519,7 @@ float speaker_dsp_process(float x)
         r = head / a;
     }
 
-    head = xp_limit - fabsf(m_high.xp);
+    head = room_p;
     if (head < xp_floor) {
         head = xp_floor;
     }
@@ -453,7 +540,39 @@ float speaker_dsp_process(float x)
 
     const float g_bass = gain_follower_run(&gf_bass, r);
 
-    // 4. Delay both bands so the gain is already down when the peak arrives.
+#if SPK_XBASS_ENABLE
+    // Extra bass: only the part that the extension filter adds to the bass
+    // band. It gets whatever travel and voltage the normal bass band leaves,
+    // so it is the first thing to go when the speaker runs out of room.
+    const float xb = biquad_run(&xb2, biquad_run(&xb1, low)) - low;
+
+    model_step(&m_xb, xb * SPK_AMP_FULL_SCALE_VPEAK);
+
+    float rx = 1.0f;
+    float room;
+
+    room = room_d - r * fabsf(m_low.xd);
+    a = fabsf(m_xb.xd);
+    if (a > room) {
+        rx = (room > 0.0f) ? room / a : 0.0f;
+    }
+
+    room = room_p - r * fabsf(m_low.xp);
+    a = fabsf(m_xb.xp);
+    if (a * rx > room) {
+        rx = (room > 0.0f) ? room / a : 0.0f;
+    }
+
+    room = low_ceiling - r * fabsf(low);
+    a = fabsf(xb);
+    if (a * rx > room) {
+        rx = (room > 0.0f) ? room / a : 0.0f;
+    }
+
+    const float g_xb = gain_follower_run(&gf_xb, rx) * xb_pw_gain;
+#endif
+
+    // 4. Delay the bands so the gains are already down when the peak arrives.
     pos = dl_x_pos;
 
     const float low_d = dl_low[pos];
@@ -462,13 +581,23 @@ float speaker_dsp_process(float x)
     dl_low[pos] = low;
     dl_high[pos] = high;
 
+#if SPK_XBASS_ENABLE
+    const float xb_d = dl_xb[pos];
+
+    dl_xb[pos] = xb;
+#endif
+
     pos++;
     if (pos >= SPK_XLIM_LOOKAHEAD) {
         pos = 0;
     }
     dl_x_pos = pos;
 
+#if SPK_XBASS_ENABLE
+    const float y = g_bass * low_d + g_xb * xb_d + high_d;
+#else
     const float y = g_bass * low_d + high_d;
+#endif
 
     // 5. Look-ahead peak limiter to the amplifier ceiling.
     a = fabsf(y);
@@ -542,6 +671,17 @@ float speaker_dsp_process(float x)
             pw_gain = 1.0f;
         }
 
+#if SPK_XBASS_ENABLE
+        // The extra bass backs off before the budget is reached, so the
+        // budget gain above rarely has to turn the whole signal down for it.
+        if (pw_avg > xb_pw_limit) {
+            xb_pw_gain -= xb_pw_gain * pw_attack;
+        }
+        else {
+            xb_pw_gain += (1.0f - xb_pw_gain) * pw_release;
+        }
+#endif
+
         st.power_avg_w = pw_avg;
         st.power_gain = pw_gain;
     }
@@ -569,6 +709,12 @@ float speaker_dsp_process(float x)
     if (g_peak < st.peak_gain_min) {
         st.peak_gain_min = g_peak;
     }
+
+#if SPK_XBASS_ENABLE
+    if (g_xb < st.xbass_gain_min) {
+        st.xbass_gain_min = g_xb;
+    }
+#endif
 
     return out;
 }
